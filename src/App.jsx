@@ -25,6 +25,7 @@ import {
   Cpu
 } from 'lucide-react';
 import { parseEthToWei, parseRpcQuantity, parseRpcResponse, assertWalletChain, receiptOutcome, savingsReport, mcpFallbackStatus, summarizeGasHistory, validateTransaction, schedulerTrigger, inspectPharosMcpTools } from './pharosCore.js';
+import { collectInjectedWallets, listenForEip6963Wallets, requestEvmWalletAccount } from './wallet.js';
 
 // Network endpoints and identifiers are kept together so wallet checks use the selected chain.
 const PHAROS_NETWORKS = {
@@ -258,6 +259,9 @@ export default function App() {
 
   // Optional Browser Wallet (MetaMask / Rabby / OKX)
   const [walletAddress, setWalletAddress] = useState(null);
+  const [walletProviders, setWalletProviders] = useState(() => collectInjectedWallets());
+  const [selectedWalletProvider, setSelectedWalletProvider] = useState(null);
+  const [showWalletChooser, setShowWalletChooser] = useState(false);
 
   // Requirement 02: Transaction Queue & Deadline Scheduler Form State
   const [selectedPresetId, setSelectedPresetId] = useState(PHAROS_PRESET_TXS[0].id);
@@ -309,39 +313,50 @@ export default function App() {
     [targetGasGwei]
   );
 
-  // Connect injected Web3 wallet if available
-  const connectBrowserWallet = async () => {
-    if (typeof window !== 'undefined' && window.ethereum) {
-      try {
-        const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
-        if (accounts && accounts[0]) {
-          setWalletAddress(accounts[0]);
-          triggerToast(`Connected ${accounts[0].slice(0, 6)}...${accounts[0].slice(-4)}`);
-        }
-      } catch (err) {
-        setErrorMsg(err.message || 'Wallet connection declined.');
+  const connectBrowserWallet = () => setShowWalletChooser(true);
+
+  const connectSelectedWallet = async (wallet) => {
+    try {
+      const { address, chainId } = await requestEvmWalletAccount(wallet.provider);
+      setWalletAddress(address);
+      setSelectedWalletProvider(wallet);
+      setShowWalletChooser(false);
+      const expectedChain = PHAROS_NETWORKS[selectedNetwork];
+      if (chainId.toLowerCase() !== expectedChain.chainIdHex.toLowerCase()) {
+        setErrorMsg(`Connected to ${wallet.name}, which is on chain ${chainId}. Switch it to ${expectedChain.shortName} (chain ${expectedChain.chainId}) before submitting.`);
+      } else {
+        triggerToast(`Connected ${wallet.name} · ${address.slice(0, 6)}...${address.slice(-4)}`);
       }
-    } else {
-      setErrorMsg(
-        'No injected EVM wallet detected. Using live Pharos RPC estimation & block anchor mode.'
-      );
+    } catch (err) {
+      setShowWalletChooser(false);
+      setErrorMsg(err?.code === 4001 ? `Connection request rejected in ${wallet.name}.` : `${wallet.name}: ${err.message || 'Wallet connection failed.'}`);
     }
   };
 
+  const refreshWalletProviders = () => {
+    setWalletProviders(collectInjectedWallets());
+    window.dispatchEvent(new Event('eip6963:requestProvider'));
+  };
+
   useEffect(() => {
-    if (!window.ethereum?.on) return undefined;
+    return listenForEip6963Wallets(window, setWalletProviders);
+  }, []);
+
+  useEffect(() => {
+    const provider = selectedWalletProvider?.provider;
+    if (!provider?.on) return undefined;
     const handleAccounts = (accounts) => setWalletAddress(accounts?.[0] || null);
     const handleChain = (chainId) => {
       const expected = PHAROS_NETWORKS[selectedNetwork].chainIdHex.toLowerCase();
       if (String(chainId).toLowerCase() !== expected) setErrorMsg(`Wallet network changed to ${chainId}. Select the matching Pharos network before submitting.`);
     };
-    window.ethereum.on('accountsChanged', handleAccounts);
-    window.ethereum.on('chainChanged', handleChain);
+    provider.on('accountsChanged', handleAccounts);
+    provider.on('chainChanged', handleChain);
     return () => {
-      window.ethereum.removeListener?.('accountsChanged', handleAccounts);
-      window.ethereum.removeListener?.('chainChanged', handleChain);
+      provider.removeListener?.('accountsChanged', handleAccounts);
+      provider.removeListener?.('chainChanged', handleChain);
     };
-  }, [selectedNetwork]);
+  }, [selectedNetwork, selectedWalletProvider]);
 
   // Requirement 01: Poll live gas price + recent block fee history from Pharos RPC & Chain MCP
   const fetchLivePharosGasState = useCallback(
@@ -488,13 +503,14 @@ export default function App() {
           txHash = await callPharosRpc(net.rpcUrl, 'eth_sendRawTransaction', [job.rawSignedTxHex.trim()]);
           broadcastMode = 'RPC raw transaction broadcast';
         } else {
-          if (!window.ethereum || !walletAddress) throw new Error('Connect a wallet to sign and submit this transaction.');
+          const provider = selectedWalletProvider?.provider;
+          if (!provider || !walletAddress) throw new Error('Connect an injected wallet to sign and submit this transaction.');
           gasUnits = parseRpcQuantity(await callPharosRpc(net.rpcUrl, 'eth_estimateGas', [txParams]), 'estimateGas');
           if (gasUnits <= 0n) throw new Error('RPC returned a zero gas estimate.');
-          const chainId = await window.ethereum.request({ method: 'eth_chainId' });
+          const chainId = await provider.request({ method: 'eth_chainId' });
           try { assertWalletChain(chainId, net.chainIdHex); } catch { throw new Error(`Wallet is on chain ${chainId}; switch it to ${net.shortName} (${net.chainId}).`); }
-          txHash = await window.ethereum.request({ method: 'eth_sendTransaction', params: [{ ...txParams, gas: `0x${gasUnits.toString(16)}` }] });
-          broadcastMode = 'Wallet signed; broadcast accepted';
+          txHash = await provider.request({ method: 'eth_sendTransaction', params: [{ ...txParams, gas: `0x${gasUnits.toString(16)}` }] });
+          broadcastMode = `${selectedWalletProvider.name} signed; broadcast accepted`;
         }
         if (!/^0x[a-f\d]{64}$/i.test(txHash)) throw new Error('Broadcast response did not return a valid transaction hash.');
         broadcastAccepted = true;
@@ -539,7 +555,7 @@ export default function App() {
         executingJobsRef.current.delete(job.id);
       }
     },
-    [walletAddress, triggerToast]
+    [walletAddress, selectedWalletProvider, triggerToast]
   );
   // Initial load + 6-second real-time gas polling interval
   useEffect(() => {
@@ -843,7 +859,7 @@ export default function App() {
               <Wallet className="w-3.5 h-3.5 text-[#2448F5]" />
               <span className="font-mono">
                 {walletAddress
-                  ? `${walletAddress.slice(0, 6)}...${walletAddress.slice(-4)}`
+                  ? `${selectedWalletProvider?.name || 'Wallet'} · ${walletAddress.slice(0, 6)}...${walletAddress.slice(-4)}`
                   : 'Connect Wallet'}
               </span>
             </button>
@@ -1976,6 +1992,35 @@ export default function App() {
           </div>
         </section>
       </main>
+
+      {showWalletChooser && (
+        <div className="fixed inset-0 z-50 bg-[#0F172A]/45 backdrop-blur-[2px] flex items-center justify-center p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowWalletChooser(false); }}>
+          <section role="dialog" aria-modal="true" aria-labelledby="wallet-chooser-title" className="bg-white rounded-2xl max-w-md w-full border border-[#CBD5E1] shadow-2xl overflow-hidden">
+            <div className="pgo-section-header flex items-center justify-between gap-3">
+              <div>
+                <h2 id="wallet-chooser-title" className="text-[15px] font-bold text-[#0F172A]">Choose an EVM wallet</h2>
+                <p className="text-[11px] text-[#64748B] mt-1">Select the browser extension you want this app to use.</p>
+              </div>
+              <button type="button" onClick={() => setShowWalletChooser(false)} className="pgo-btn-tab bg-white border border-[#CBD5E1] text-[12px] font-semibold">Close</button>
+            </div>
+            <div className="pgo-section-body space-y-2">
+              {walletProviders.length ? walletProviders.map((wallet, index) => (
+                <button key={wallet.uuid || `${wallet.name}-${index}`} type="button" onClick={() => connectSelectedWallet(wallet)} className="w-full p-3 rounded-xl border border-[#CBD5E1] hover:border-[#2448F5] hover:bg-[#EEF2FF]/60 text-left flex items-center justify-between gap-3">
+                  <span className="font-semibold text-[13px] text-[#0F172A]">{wallet.name}</span>
+                  <span className="text-[11px] text-[#2448F5] font-semibold">Connect</span>
+                </button>
+              )) : (
+                <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-[12px] text-amber-900 space-y-2">
+                  <p>No injected wallet was found in this browser tab. Make sure the extension is enabled and unlocked, then reload the app in a regular browser tab. Extensions may not inject into embedded previews.</p>
+                  <button type="button" onClick={refreshWalletProviders} className="rounded-md px-3 py-1.5 bg-white border border-amber-300 font-semibold">Scan again</button>
+                </div>
+              )}
+              {walletProviders.length > 1 && <p className="text-[10px] text-[#64748B]">Each wallet is requested individually; the app will use only the provider you select.</p>}
+              <button type="button" onClick={refreshWalletProviders} className="text-[11px] text-[#2448F5] font-semibold underline">Refresh detected wallets</button>
+            </div>
+          </section>
+        </div>
+      )}
 
       {/* README Documentation Modal */}
       {showReadmeModal && (

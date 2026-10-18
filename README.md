@@ -38,10 +38,15 @@ The transaction presets are Atlantic testnet examples. They are blocked on Pacif
 
 - Scheduling records a job and attempts submission when the live RPC gas reading reaches the target or the deadline arrives. A deadline means an attempt is triggered; it does not guarantee a wallet is available, the RPC accepts the transaction, or the chain confirms it.
 - Unsigned transactions require an injected wallet, explicit wallet approval, and a chain ID matching the selected network.
+- Wallet discovery uses EIP-6963 plus legacy injected-provider fallbacks, including OKX's `window.okxwallet`. In the wallet chooser, select the extension you want to authorize.
 - Raw signed transaction bytes are only checked for hex encoding. The UI asks before broadcasting them. Their decoded destination, value, nonce, chain ID, and fee cap are not inspected.
 - A successful wallet/RPC response is recorded as `submitted`, not `confirmed`. Receipt status, gas used, and effective gas price update the record when a receipt arrives. A transaction still pending after the bounded polling window remains `submitted`.
 - Receipt-based realized savings compare receipt gas used at the recorded request-time `eth_gasPrice` against actual receipt `effectiveGasPrice`. This is a retrospective comparison, not a guarantee of savings versus an alternative transaction that was never sent.
 - Jobs and reports live in browser memory and are lost on reload. The scheduler requires this page to remain open.
+
+### Wallet connection troubleshooting
+
+Use a regular tab in a browser where the wallet extension is installed and enabled. Unlock the extension, reload the app, choose it in the wallet picker, and approve the account request. Extensions commonly do not inject into embedded previews or isolated browser profiles. If the wallet is missing, use **Refresh detected wallets** in the chooser. Before submitting, switch the wallet to the selected Pharos network.
 
 ## Tests
 
