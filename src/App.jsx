@@ -24,8 +24,9 @@ import {
   X,
   Cpu
 } from 'lucide-react';
+import { parseEthToWei, parseRpcQuantity, parseRpcResponse, assertWalletChain, receiptOutcome, savingsReport, mcpFallbackStatus, summarizeGasHistory, validateTransaction, schedulerTrigger, inspectPharosMcpTools } from './pharosCore.js';
 
-// Official Pharos Network Configurations with exact Explorer links requested
+// Network endpoints and identifiers are kept together so wallet checks use the selected chain.
 const PHAROS_NETWORKS = {
   atlantic: {
     id: 'atlantic',
@@ -36,24 +37,22 @@ const PHAROS_NETWORKS = {
     symbol: 'PHRS',
     rpcUrl: 'https://atlantic.dplabs-internal.com',
     mcpUrl: 'https://mcp.pharos.xyz/mcp',
-    skillEngineUrl: 'https://ai.pharos.xyz',
     explorerUrl: 'https://atlantic.pharosscan.xyz'
   },
   mainnet: {
     id: 'mainnet',
     name: 'Pharos Mainnet',
-    shortName: 'Pharos Mainnet',
+    shortName: 'Pacific Mainnet',
     chainId: 1672,
     chainIdHex: '0x688',
-    symbol: 'PHRS',
+    symbol: 'PROS',
     rpcUrl: 'https://rpc.pharos.xyz',
     mcpUrl: 'https://mcp.pharos.xyz/mcp',
-    skillEngineUrl: 'https://ai.pharos.xyz',
     explorerUrl: 'https://www.pharosscan.xyz'
   }
 };
 
-// Official Deployed Contracts on Pharos for realistic gas estimation & submission
+// Example Atlantic testnet payloads. Preset addresses must not be assumed to exist on mainnet.
 const PHAROS_PRESET_TXS = [
   {
     id: 'wphrs_deposit',
@@ -64,7 +63,7 @@ const PHAROS_PRESET_TXS = [
     to: '0x838800b758277CC111B2d48Ab01e5E164f8E9471',
     data: '0xd0e30db0', // deposit()
     valueEth: '0.001',
-    description: 'Calls deposit() on official Pharos WPHRS Contract'
+    description: 'Atlantic testnet example: deposit() on the WPHRS contract'
   },
   {
     id: 'usdc_transfer',
@@ -100,12 +99,8 @@ const PHAROS_LOGO_PATHS = [
 ];
 
 function hexToBigInt(hex) {
-  if (!hex || hex === '0x' || hex === '0x0') return 0n;
-  try {
-    return BigInt(hex);
-  } catch {
-    return 0n;
-  }
+  if (hex === '0x') return 0n;
+  return parseRpcQuantity(hex);
 }
 
 function weiToGwei(weiBigInt) {
@@ -114,7 +109,7 @@ function weiToGwei(weiBigInt) {
 }
 
 function formatGwei(gweiNum) {
-  if (gweiNum === null || gweiNum === undefined || isNaN(gweiNum)) return '0.00';
+  if (gweiNum === null || gweiNum === undefined || !Number.isFinite(gweiNum)) return '—';
   if (gweiNum > 0 && gweiNum < 0.01) return gweiNum.toFixed(6);
   if (gweiNum < 1) return gweiNum.toFixed(4);
   return gweiNum.toFixed(2);
@@ -134,57 +129,55 @@ function copyTextFallback(text) {
 }
 
 async function callPharosRpc(rpcUrl, method, params = []) {
-  const response = await fetch(rpcUrl, {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+  let response;
+  const requestId = Date.now() + Math.floor(Math.random() * 1000);
+  try { response = await fetch(rpcUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    signal: controller.signal,
     body: JSON.stringify({
       jsonrpc: '2.0',
-      id: Date.now() + Math.floor(Math.random() * 1000),
+      id: requestId,
       method,
       params
     })
-  });
+  }); } finally { clearTimeout(timeout); }
   if (!response.ok) {
     throw new Error(`RPC HTTP ${response.status}`);
   }
   const data = await response.json();
-  if (data.error) {
-    throw new Error(data.error.message || 'RPC execution error');
-  }
-  return data.result;
+  return parseRpcResponse(data, requestId);
 }
 
-async function pingPharosChainMcp(mcpUrl, chainId, latestGasGwei) {
+async function pingPharosChainMcp(mcpUrl) {
   const start = performance.now();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
   try {
-    await fetch(mcpUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json, text/event-stream'
-      },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'tools/call',
-        params: {
-          name: 'optimize_gas_fee',
-          arguments: { chainId, currentGasGwei: latestGasGwei }
-        }
-      })
-    });
-    return {
-      connected: true,
-      latencyMs: Math.round(performance.now() - start),
-      engine: 'Pharos Chain MCP · Skill Engine'
+    const mcpPost = async (payload, sessionId) => {
+      const headers = { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', 'MCP-Protocol-Version': '2025-03-26' };
+      if (sessionId) headers['Mcp-Session-Id'] = sessionId;
+      const response = await fetch(mcpUrl, { method: 'POST', headers, signal: controller.signal, body: JSON.stringify(payload) });
+      if (!response.ok) throw new Error(`MCP HTTP ${response.status}`);
+      const text = await response.text();
+      const json = text.split('\n').filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).at(-1) || text;
+      return { payload: JSON.parse(json), sessionId: response.headers.get('Mcp-Session-Id') || sessionId };
     };
-  } catch {
-    return {
-      connected: true,
-      latencyMs: Math.round(performance.now() - start),
-      engine: 'Pharos Chain MCP · Live RPC'
-    };
-  }
+    const initialized = await mcpPost({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'pharos-gas-optimizer', version: '1.0.0' } } });
+    if (initialized.payload.error || !initialized.payload.result?.protocolVersion) throw new Error(initialized.payload.error?.message || 'MCP initialize response is malformed.');
+    const notificationHeaders = { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', 'MCP-Protocol-Version': initialized.payload.result.protocolVersion };
+    if (initialized.sessionId) notificationHeaders['Mcp-Session-Id'] = initialized.sessionId;
+    const notificationResponse = await fetch(mcpUrl, { method: 'POST', headers: notificationHeaders, signal: controller.signal, body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) });
+    if (!notificationResponse.ok) throw new Error(`MCP initialized notification HTTP ${notificationResponse.status}`);
+    const { payload } = await mcpPost({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }, initialized.sessionId);
+    inspectPharosMcpTools(payload);
+    // Discovery is reported only; live readings and estimates in this page still use direct RPC.
+    return { connected: true, available: true, latencyMs: Math.round(performance.now() - start), engine: 'Pharos MCP catalog found · RPC data path', reason: 'MCP tools are discovered but not invoked by this dashboard.' };
+  } catch (err) {
+    return { ...mcpFallbackStatus(err), latencyMs: Math.round(performance.now() - start) };
+  } finally { clearTimeout(timeout); }
 }
 
 const PharosBrandLogo = () => {
@@ -234,7 +227,7 @@ const PharosBrandLogo = () => {
           </span>
         </div>
         <span className="text-[11px] font-medium text-[#64748B] mt-1 leading-none">
-          Chain MCP · Skill Engine
+          Pharos MCP catalog · direct RPC
         </span>
       </div>
     </div>
@@ -257,9 +250,10 @@ export default function App() {
   const [latestBlockNumber, setLatestBlockNumber] = useState(null);
   const [gasHistory, setGasHistory] = useState([]);
   const [mcpStatus, setMcpStatus] = useState({
-    connected: true,
-    latencyMs: 38,
-    engine: 'Pharos Chain MCP · Skill Engine'
+    connected: false,
+    available: false,
+    latencyMs: null,
+    engine: 'MCP not checked · RPC live'
   });
 
   // Optional Browser Wallet (MetaMask / Rabby / OKX)
@@ -280,7 +274,11 @@ export default function App() {
   const [executionReports, setExecutionReports] = useState([]);
 
   const currentNet = PHAROS_NETWORKS[selectedNetwork];
-  const latestGasRef = useRef({ gwei: 1.0, wei: 1000000000n, blockNumber: 0 });
+  const latestGasRef = useRef({ networkId: null, gwei: null, wei: 0n, blockNumber: null });
+  const executingJobsRef = useRef(new Set());
+  const pollingRef = useRef(false);
+  const mcpPollingRef = useRef(false);
+  const pollNetworkRef = useRef(selectedNetwork);
 
   const triggerToast = useCallback((msg) => {
     setToastMsg(msg);
@@ -330,24 +328,39 @@ export default function App() {
     }
   };
 
+  useEffect(() => {
+    if (!window.ethereum?.on) return undefined;
+    const handleAccounts = (accounts) => setWalletAddress(accounts?.[0] || null);
+    const handleChain = (chainId) => {
+      const expected = PHAROS_NETWORKS[selectedNetwork].chainIdHex.toLowerCase();
+      if (String(chainId).toLowerCase() !== expected) setErrorMsg(`Wallet network changed to ${chainId}. Select the matching Pharos network before submitting.`);
+    };
+    window.ethereum.on('accountsChanged', handleAccounts);
+    window.ethereum.on('chainChanged', handleChain);
+    return () => {
+      window.ethereum.removeListener?.('accountsChanged', handleAccounts);
+      window.ethereum.removeListener?.('chainChanged', handleChain);
+    };
+  }, [selectedNetwork]);
+
   // Requirement 01: Poll live gas price + recent block fee history from Pharos RPC & Chain MCP
   const fetchLivePharosGasState = useCallback(
     async (netKey = selectedNetwork, initializeTarget = false) => {
       const net = PHAROS_NETWORKS[netKey];
+      if (pollingRef.current) return;
+      pollingRef.current = true;
       setIsSyncing(true);
 
       try {
-        const [gasPriceHex, blockNumHex, feeHistoryResult] = await Promise.all([
+        const [gasPriceHex, blockNumHex] = await Promise.all([
           callPharosRpc(net.rpcUrl, 'eth_gasPrice', []),
-          callPharosRpc(net.rpcUrl, 'eth_blockNumber', []),
-          callPharosRpc(net.rpcUrl, 'eth_feeHistory', ['0xc', 'latest', [25, 50, 75]]).catch(
-            () => null
-          )
+          callPharosRpc(net.rpcUrl, 'eth_blockNumber', [])
         ]);
 
         const liveGasWei = hexToBigInt(gasPriceHex);
         const liveGasGwei = weiToGwei(liveGasWei);
         const headBlock = Number(hexToBigInt(blockNumHex));
+        if (netKey !== pollNetworkRef.current) return;
 
         // Fetch last 8 blocks for historical gas curve & table
         const blockCount = 8;
@@ -365,16 +378,20 @@ export default function App() {
           )
         );
 
-        const mcpPing = await pingPharosChainMcp(net.mcpUrl, net.chainId, liveGasGwei);
-        setMcpStatus(mcpPing);
+        if (netKey !== pollNetworkRef.current) return;
+        if (!mcpPollingRef.current) {
+          mcpPollingRef.current = true;
+          void pingPharosChainMcp(net.mcpUrl).then((status) => {
+            if (netKey === pollNetworkRef.current) setMcpStatus(status);
+          }).finally(() => { mcpPollingRef.current = false; });
+        }
 
         const historyPoints = [];
         blocksData.forEach((blk, idx) => {
           const bNum = blockNumbersToFetch[idx];
           if (!blk) return;
 
-          const baseFeeWei = blk.baseFeePerGas ? hexToBigInt(blk.baseFeePerGas) : liveGasWei;
-          let avgTxGasWei = baseFeeWei;
+          let avgTxGasWei = null;
 
           if (Array.isArray(blk.transactions) && blk.transactions.length > 0) {
             let sumWei = 0n;
@@ -388,26 +405,18 @@ export default function App() {
             if (count > 0) {
               avgTxGasWei = sumWei / BigInt(count);
             }
-          } else if (
-            feeHistoryResult &&
-            Array.isArray(feeHistoryResult.baseFeePerGas) &&
-            feeHistoryResult.baseFeePerGas[idx]
-          ) {
-            avgTxGasWei = hexToBigInt(feeHistoryResult.baseFeePerGas[idx]);
           }
-
-          const pointGwei = weiToGwei(avgTxGasWei > 0n ? avgTxGasWei : liveGasWei);
-          const gasUsed = Number(hexToBigInt(blk.gasUsed));
-          const gasLimit = Math.max(1, Number(hexToBigInt(blk.gasLimit)));
-          const utilizationPct = Math.min(100, Math.round((gasUsed / gasLimit) * 100));
+          const pointWei = avgTxGasWei ?? (blk.baseFeePerGas ? hexToBigInt(blk.baseFeePerGas) : null);
+          if (pointWei === null) return;
+          const pointGwei = weiToGwei(pointWei);
           const timestampSec = Number(hexToBigInt(blk.timestamp));
 
           historyPoints.push({
             blockNumber: bNum,
             gasGwei: pointGwei,
-            gasWei: (avgTxGasWei > 0n ? avgTxGasWei : liveGasWei).toString(),
+            gasWei: pointWei.toString(),
+            sampleType: avgTxGasWei === null ? 'Block base fee' : 'Average transaction gas price',
             txCount: Array.isArray(blk.transactions) ? blk.transactions.length : 0,
-            utilizationPct,
             timestamp: timestampSec
               ? new Date(timestampSec * 1000).toLocaleTimeString([], {
                   hour: '2-digit',
@@ -418,24 +427,7 @@ export default function App() {
           });
         });
 
-        if (
-          historyPoints.length === 0 ||
-          historyPoints[historyPoints.length - 1].blockNumber !== headBlock
-        ) {
-          historyPoints.push({
-            blockNumber: headBlock,
-            gasGwei: liveGasGwei,
-            gasWei: liveGasWei.toString(),
-            txCount: 0,
-            utilizationPct: 12,
-            timestamp: new Date().toLocaleTimeString([], {
-              hour: '2-digit',
-              minute: '2-digit',
-              second: '2-digit'
-            })
-          });
-        }
-
+        if (netKey !== pollNetworkRef.current) return;
         setCurrentGasWei(liveGasWei);
         setCurrentGasGwei(liveGasGwei);
         setLatestBlockNumber(headBlock);
@@ -447,6 +439,7 @@ export default function App() {
           })
         );
         latestGasRef.current = {
+          networkId: netKey,
           gwei: liveGasGwei,
           wei: liveGasWei,
           blockNumber: headBlock
@@ -461,13 +454,14 @@ export default function App() {
             .slice(-14);
         });
 
-        if (initializeTarget || targetGasGwei === '') {
-          const defaultTarget = liveGasGwei > 0 ? (liveGasGwei * 0.98).toFixed(4) : '1.00';
+        if ((initializeTarget || targetGasGwei === '') && liveGasGwei > 0) {
+          const defaultTarget = (liveGasGwei * 0.98).toFixed(4);
           setTargetGasGwei(defaultTarget);
         }
       } catch (err) {
         setErrorMsg(`Live Pharos RPC Error: ${err.message}`);
       } finally {
+        pollingRef.current = false;
         setIsSyncing(false);
       }
     },
@@ -477,122 +471,86 @@ export default function App() {
   // Execute a queued transaction when gas is favorable OR when the deadline is reached (Requirements 02, 03, 04)
   const executeScheduledTransaction = useCallback(
     async (job, triggerReason, executionGasGwei, executionGasWei, executionBlock) => {
+      if (executingJobsRef.current.has(job.id)) return;
+      executingJobsRef.current.add(job.id);
+      setQueuedJobs((items) => items.map((item) => item.id === job.id ? { ...item, status: 'executing' } : item));
       const net = PHAROS_NETWORKS[job.networkId];
+      let broadcastAccepted = false;
       try {
-        const valueWeiBigInt = BigInt(Math.round(parseFloat(job.valueEth || '0') * 1e18));
-        const valueHex = '0x' + valueWeiBigInt.toString(16);
-
-        const [estimatedGasHex, latestBlockData] = await Promise.all([
-          callPharosRpc(net.rpcUrl, 'eth_estimateGas', [
-            {
-              from: walletAddress || '0x838800b758277CC111B2d48Ab01e5E164f8E9471',
-              to: job.to,
-              data: job.data || '0x',
-              value: valueHex
-            }
-          ]).catch(() => '0x5208'),
-          callPharosRpc(net.rpcUrl, 'eth_getBlockByNumber', ['latest', true]).catch(() => null)
-        ]);
-
-        const gasUnits = Number(hexToBigInt(estimatedGasHex)) || 21000;
-        let broadcastTxHash = null;
-        let broadcastMode = 'Live RPC Estimate & Block Anchor';
-
-        if (job.rawSignedTxHex && job.rawSignedTxHex.trim().startsWith('0x')) {
-          try {
-            broadcastTxHash = await callPharosRpc(net.rpcUrl, 'eth_sendRawTransaction', [
-              job.rawSignedTxHex.trim()
-            ]);
-            broadcastMode = 'Broadcasted via eth_sendRawTransaction';
-          } catch (rawErr) {
-            broadcastMode = `RPC Verified (${rawErr.message.slice(0, 38)})`;
-          }
-        } else if (typeof window !== 'undefined' && window.ethereum && walletAddress) {
-          try {
-            broadcastTxHash = await window.ethereum.request({
-              method: 'eth_sendTransaction',
-              params: [
-                {
-                  from: walletAddress,
-                  to: job.to,
-                  data: job.data || '0x',
-                  value: valueHex,
-                  gas: '0x' + gasUnits.toString(16)
-                }
-              ]
-            });
-            broadcastMode = 'Signed & Broadcasted via Web3 Wallet';
-          } catch {
-            broadcastMode = 'Live RPC Execution at Target Block';
-          }
+        validateTransaction(job);
+        const valueHex = `0x${parseEthToWei(job.valueEth || '0').toString(16)}`;
+        const txParams = { from: walletAddress, to: job.to, data: job.data || '0x', value: valueHex };
+        let gasUnits = null;
+        let txHash;
+        let broadcastMode;
+        if (job.rawSignedTxHex) {
+          if (!window.confirm('Broadcast this pre-signed raw transaction? Broadcasting can make it irreversible.')) throw new Error('Raw transaction broadcast cancelled by user.');
+          txHash = await callPharosRpc(net.rpcUrl, 'eth_sendRawTransaction', [job.rawSignedTxHex.trim()]);
+          broadcastMode = 'RPC raw transaction broadcast';
+        } else {
+          if (!window.ethereum || !walletAddress) throw new Error('Connect a wallet to sign and submit this transaction.');
+          gasUnits = parseRpcQuantity(await callPharosRpc(net.rpcUrl, 'eth_estimateGas', [txParams]), 'estimateGas');
+          if (gasUnits <= 0n) throw new Error('RPC returned a zero gas estimate.');
+          const chainId = await window.ethereum.request({ method: 'eth_chainId' });
+          try { assertWalletChain(chainId, net.chainIdHex); } catch { throw new Error(`Wallet is on chain ${chainId}; switch it to ${net.shortName} (${net.chainId}).`); }
+          txHash = await window.ethereum.request({ method: 'eth_sendTransaction', params: [{ ...txParams, gas: `0x${gasUnits.toString(16)}` }] });
+          broadcastMode = 'Wallet signed; broadcast accepted';
         }
-
-        const realBlockTxHash =
-          broadcastTxHash ||
-          (latestBlockData?.transactions?.[0]?.hash ?? latestBlockData?.hash ?? null);
-
-        // Requirement 03: Calculate actual gas paid vs gas price at request time
-        const requestCostWei = BigInt(gasUnits) * BigInt(job.requestGasWei);
-        const actualPaidWei = BigInt(gasUnits) * BigInt(executionGasWei);
-        const deltaWei = requestCostWei - actualPaidWei;
-        const deltaGwei = job.requestGasGwei - executionGasGwei;
-        const pctDiff =
-          job.requestGasGwei > 0
-            ? ((job.requestGasGwei - executionGasGwei) / job.requestGasGwei) * 100
-            : 0;
-
-        const report = {
-          id: job.id,
-          label: job.label,
-          to: job.to,
-          networkId: job.networkId,
-          networkName: net.shortName,
-          explorerUrl: net.explorerUrl,
-          symbol: net.symbol,
-          triggerReason, // 'FAVORABLE_GAS' | 'DEADLINE_REACHED' | 'MANUAL_NOW'
-          submittedAt: new Date().toLocaleTimeString([], {
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit'
-          }),
-          requestBlock: job.requestBlock,
-          executionBlock: executionBlock || latestGasRef.current.blockNumber,
-          gasUnits,
-          requestGasGwei: job.requestGasGwei,
-          actualGasGwei: executionGasGwei,
-          targetGasGwei: job.targetGasGwei,
-          requestCostGweiTotal: weiToGwei(requestCostWei),
-          actualPaidGweiTotal: weiToGwei(actualPaidWei),
-          savedGweiPerGas: deltaGwei,
-          savedTotalGwei: weiToGwei(deltaWei),
-          pctDiff,
-          txHash: realBlockTxHash,
-          broadcastMode,
-          missedDeadline: false
-        };
-
-        setExecutionReports((prev) => [report, ...prev]);
-        triggerToast(
-          triggerReason === 'FAVORABLE_GAS'
-            ? `Executed on favorable gas (${formatGwei(executionGasGwei)} Gwei)`
-            : triggerReason === 'DEADLINE_REACHED'
-            ? `Deadline reached — auto-submitted at ${formatGwei(executionGasGwei)} Gwei`
-            : `Transaction executed immediately`
-        );
+        if (!/^0x[a-f\d]{64}$/i.test(txHash)) throw new Error('Broadcast response did not return a valid transaction hash.');
+        broadcastAccepted = true;
+        setQueuedJobs((items) => items.filter((item) => item.id !== job.id));
+        setExecutionReports((items) => [{ id: job.id, label: job.label, to: job.to, networkId: job.networkId,
+          networkName: net.shortName, explorerUrl: net.explorerUrl, symbol: net.symbol, triggerReason,
+          submittedAt: new Date().toLocaleTimeString(), requestBlock: job.requestBlock, executionBlock,
+          gasUnits: gasUnits === null ? null : Number(gasUnits), requestGasGwei: job.requestGasGwei, actualGasGwei: null,
+          targetGasGwei: job.targetGasGwei, txHash, broadcastMode, status: 'submitted',
+          realizedSavingsGwei: null, actualFeeWei: null }, ...items]);
+        triggerToast('Broadcast accepted; awaiting transaction receipt.');
+        for (let attempt = 0; attempt < 40; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          const receipt = await callPharosRpc(net.rpcUrl, 'eth_getTransactionReceipt', [txHash]);
+          if (!receipt) continue;
+          const outcome = receiptOutcome(receipt);
+          const used = outcome.gasUsed;
+          const effectivePrice = outcome.effectiveGasPriceWei;
+          const feeComparison = savingsReport({ requestGasPriceWei: BigInt(job.requestGasWei), actualGasPriceWei: effectivePrice, gasUsed: used });
+          const actualFeeWei = feeComparison.actualFeeWei;
+          const projectedFeeWei = feeComparison.projectedRequestFeeWei;
+          setExecutionReports((items) => items.map((item) => item.id === job.id ? {
+            ...item, status: outcome.status,
+            executionBlock: Number(parseRpcQuantity(receipt.blockNumber, 'receipt blockNumber')),
+            gasUnits: Number(used), actualGasGwei: weiToGwei(effectivePrice), actualFeeWei: actualFeeWei.toString(),
+            projectedRequestFeeWei: projectedFeeWei.toString(),
+            realizedSavingsGwei: outcome.status === 'confirmed' ? weiToGwei(projectedFeeWei - actualFeeWei) : null,
+            realizedSavingsPct: outcome.status === 'confirmed' && projectedFeeWei > 0n ? Number((projectedFeeWei - actualFeeWei) * 10000n / projectedFeeWei) / 100 : null
+          } : item));
+          break;
+        }
       } catch (err) {
         setErrorMsg(`Execution Error: ${err.message}`);
+        if (broadcastAccepted) {
+          setExecutionReports((items) => items.map((item) => item.id === job.id ? { ...item, status: 'submitted', receiptError: err.message } : item));
+        } else {
+          setQueuedJobs((items) => items.filter((item) => item.id !== job.id));
+          setExecutionReports((items) => [{ id: job.id, label: job.label, status: 'failed', error: err.message,
+            txHash: null, submittedAt: new Date().toLocaleTimeString(), triggerReason }, ...items]);
+        }
+      } finally {
+        executingJobsRef.current.delete(job.id);
       }
     },
     [walletAddress, triggerToast]
   );
-
   // Initial load + 6-second real-time gas polling interval
   useEffect(() => {
-    fetchLivePharosGasState(selectedNetwork, true);
+    pollNetworkRef.current = selectedNetwork;
+    // The RPC poll controls loading state while synchronizing with the selected network.
+    // eslint-disable-next-line react/set-state-in-effect
+    const initialFetch = setTimeout(() => fetchLivePharosGasState(selectedNetwork, true), 0);
     const interval = setInterval(() => {
       fetchLivePharosGasState(selectedNetwork, false);
     }, 6000);
-    return () => clearInterval(interval);
+    return () => { clearTimeout(initialFetch); clearInterval(interval); };
   }, [selectedNetwork]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 1-second High-Precision Scheduler Loop for Queued Transactions (Requirements 02 & 04)
@@ -605,42 +563,44 @@ export default function App() {
       const liveWei = latestGasRef.current.wei;
       const liveBlock = latestGasRef.current.blockNumber;
 
-      setQueuedJobs((currentQueue) => {
-        const remaining = [];
-        currentQueue.forEach((job) => {
+      queuedJobs.forEach((job) => {
+          if (job.status === 'executing' || executingJobsRef.current.has(job.id)) return;
+          if (latestGasRef.current.networkId !== job.networkId || latestGasRef.current.gwei === null) return;
           const secondsLeft = Math.max(0, Math.ceil((job.deadlineAtMs - nowMs) / 1000));
-          const isGasFavorable = liveGwei <= job.targetGasGwei;
-          const isDeadlineReached = nowMs >= job.deadlineAtMs;
-
-          if (isGasFavorable) {
-            executeScheduledTransaction(job, 'FAVORABLE_GAS', liveGwei, liveWei, liveBlock);
-          } else if (isDeadlineReached) {
-            executeScheduledTransaction(job, 'DEADLINE_REACHED', liveGwei, liveWei, liveBlock);
-          } else {
-            remaining.push({ ...job, secondsLeft });
+          const trigger = schedulerTrigger(job, liveGwei, nowMs);
+          if (trigger) {
+            executeScheduledTransaction(job, trigger, liveGwei, liveWei, liveBlock);
+          } else if (secondsLeft !== job.secondsLeft) {
+            setQueuedJobs((items) => items.map((item) => item.id === job.id ? { ...item, secondsLeft } : item));
           }
-        });
-        return remaining;
       });
     }, 1000);
 
     return () => clearInterval(timer);
-  }, [queuedJobs.length, executeScheduledTransaction]);
+  }, [queuedJobs, executeScheduledTransaction]);
 
   // Queue a new transaction with a deadline (Requirement 02)
   const handleQueueTransaction = (e, customMode = null) => {
     if (e) e.preventDefault();
-    if (!isAddressValid) {
-      setErrorMsg('Please provide a valid 42-character Pharos destination address (0x...).');
+    const parsedTarget = customMode === 'favorable' ? (currentGasGwei ?? 1) * 1.05 : customMode === 'deadline_guard' ? (currentGasGwei ?? 1) * 0.1 : Number(targetGasGwei);
+    const parsedDeadline = customMode === 'favorable' ? 45 : customMode === 'deadline_guard' ? 10 : Number(deadlineSeconds);
+    if (selectedNetwork === 'mainnet' && selectedPresetId !== 'custom') {
+      setErrorMsg('These transaction presets are Atlantic testnet examples. Edit the transaction fields to switch to a custom mainnet transaction.');
       return;
     }
-    if (!isCalldataValid) {
-      setErrorMsg('Calldata must be a valid hex string starting with 0x.');
+    try {
+      validateTransaction({ to: txTo.trim(), data: txData.trim() || '0x', valueEth: txValueEth || '0', targetGasGwei: parsedTarget, deadlineSeconds: parsedDeadline, rawSignedTxHex: rawSignedTxHex.trim() });
+    } catch (err) {
+      setErrorMsg(err.message);
       return;
     }
 
-    const baseGwei = currentGasGwei ?? 1.0;
-    const baseWei = currentGasWei > 0n ? currentGasWei : 1000000000n;
+    if (currentGasGwei === null || currentGasWei <= 0n) {
+      setErrorMsg('A live gas price is required before scheduling a transaction.');
+      return;
+    }
+    const baseGwei = currentGasGwei;
+    const baseWei = currentGasWei;
 
     let parsedTargetGwei = parseFloat(targetGasGwei);
     let parsedDeadlineSec = Number(deadlineSeconds) || 30;
@@ -657,9 +617,7 @@ export default function App() {
       modeLabel = `${modeLabel} · 10s Deadline Guard`;
     }
 
-    if (isNaN(parsedTargetGwei) || parsedTargetGwei <= 0) {
-      parsedTargetGwei = baseGwei;
-    }
+    if (!Number.isFinite(parsedTargetGwei) || parsedTargetGwei <= 0) return;
 
     const nowMs = Date.now();
     const newJob = {
@@ -670,6 +628,7 @@ export default function App() {
       data: txData.trim() || '0x',
       valueEth: txValueEth || '0',
       rawSignedTxHex: rawSignedTxHex.trim(),
+      status: 'queued',
       requestGasGwei: baseGwei,
       requestGasWei: baseWei.toString(),
       requestBlock: latestBlockNumber || 0,
@@ -689,39 +648,33 @@ export default function App() {
     if (gasHistory.length === 0) {
       return { min: null, max: null, avg: null };
     }
-    const values = gasHistory.map((h) => h.gasGwei);
-    const min = Math.min(...values);
-    const max = Math.max(...values);
-    const avg = values.reduce((acc, v) => acc + v, 0) / values.length;
-    return { min, max, avg };
+    return summarizeGasHistory(gasHistory);
   }, [gasHistory]);
 
   // Compute genuine Execution Audit summary metrics from real execution records
   const auditSummary = useMemo(() => {
-    const count = executionReports.length;
-    if (count === 0) {
+    const confirmed = executionReports.filter((report) => report.status === 'confirmed');
+    const count = confirmed.length;
+    const failedCount = executionReports.filter((r) => r.status === 'failed').length;
+    if (executionReports.length === 0) {
       return {
         executedCount: 0,
         avgSavingsPct: null,
         avgSavedGwei: null,
-        deadlineSuccessRate: null,
-        missedDeadlines: 0
+        successRate: null,
+        failedCount: 0
       };
     }
-    const totalPct = executionReports.reduce((acc, r) => acc + (r.pctDiff || 0), 0);
-    const totalSavedGwei = executionReports.reduce(
-      (acc, r) => acc + (r.savedGweiPerGas || 0),
-      0
-    );
-    const missed = executionReports.filter((r) => r.missedDeadline).length;
-    const successRate = Math.round(((count - missed) / count) * 100);
+    const savings = confirmed.map((report) => report.realizedSavingsGwei).filter(Number.isFinite);
+    const totalSavedGwei = savings.reduce((acc, value) => acc + value, 0);
+    const successRate = count + failedCount ? Math.round((count / (count + failedCount)) * 100) : null;
 
     return {
       executedCount: count,
-      avgSavingsPct: totalPct / count,
+      avgSavingsPct: savings.length ? confirmed.reduce((sum, report) => sum + (report.realizedSavingsPct || 0), 0) / savings.length : null,
       avgSavedGwei: totalSavedGwei / count,
-      deadlineSuccessRate: successRate,
-      missedDeadlines: missed
+      successRate,
+      failedCount
     };
   }, [executionReports]);
 
@@ -850,7 +803,10 @@ export default function App() {
                     onClick={() => {
                       setSelectedNetwork(net.id);
                       setGasHistory([]);
-                      fetchLivePharosGasState(net.id, true);
+                      setCurrentGasGwei(null);
+                      setCurrentGasWei(0n);
+                      setLatestBlockNumber(null);
+                      latestGasRef.current = { networkId: net.id, gwei: null, wei: 0n, blockNumber: null };
                     }}
                     className={`pgo-btn-tab text-[12px] font-semibold transition-all duration-150 flex items-center gap-2 cursor-pointer ${
                       isActive
@@ -872,11 +828,11 @@ export default function App() {
 
           {/* Right: Connection Status, Wallet, Explorer, README */}
           <div className="flex items-center gap-2.5">
-            <div className="hidden lg:inline-flex items-center gap-2 pgo-btn-nav bg-[#F8FAFC] border border-[#CBD5E1] text-[12px] text-[#475569]">
-              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-              <span className="font-semibold text-[#0F172A]">RPC Live</span>
+            <div title={mcpStatus.reason || 'MCP catalog status'} className="hidden lg:inline-flex items-center gap-2 pgo-btn-nav bg-[#F8FAFC] border border-[#CBD5E1] text-[12px] text-[#475569]">
+              <span className={`w-2 h-2 rounded-full ${mcpStatus.connected ? 'bg-emerald-500' : 'bg-amber-500'}`} />
+              <span className="font-semibold text-[#0F172A]">RPC Live · {mcpStatus.connected ? 'MCP discovered' : 'RPC fallback'}</span>
               <span className="text-slate-300">·</span>
-              <span className="font-mono font-medium text-[#475569]">{mcpStatus.latencyMs}ms</span>
+              <span className="font-mono font-medium text-[#475569]">{mcpStatus.latencyMs === null ? '—' : `${mcpStatus.latencyMs}ms`}</span>
             </div>
 
             <button
@@ -1049,7 +1005,7 @@ export default function App() {
                 </div>
               </div>
               <div className="pgo-stat-pill bg-[#EEF2FF]/70 border border-[#2448F5]/20">
-                <div className="text-[10px] font-medium text-[#2448F5] leading-none">Avg</div>
+                <div className="text-[10px] font-medium text-[#2448F5] leading-none">Sample Avg</div>
                 <div className="text-[13px] font-bold font-mono text-[#2448F5] tabular-nums mt-1 leading-none">
                   {gasMetrics.avg !== null ? formatGwei(gasMetrics.avg) : '—'}
                 </div>
@@ -1073,11 +1029,11 @@ export default function App() {
             </div>
           </div>
 
-          {/* Card 4: Skill Engine & Queue Status */}
+          {/* Card 4: MCP Catalog & Queue Status */}
           <div className="pgo-card pgo-metric-card flex flex-col justify-between">
             <div className="flex items-center justify-between gap-2">
               <span className="text-[11px] font-bold text-[#475569] uppercase tracking-wider">
-                Skill Engine · Queue
+                MCP Catalog · Queue
               </span>
               <div className="w-6 h-6 rounded-lg bg-[#EEF2FF] border border-[#2448F5]/15 flex items-center justify-center text-[#2448F5]">
                 <Cpu className="w-3.5 h-3.5" />
@@ -1094,13 +1050,13 @@ export default function App() {
               <div className="pgo-stat-pill bg-[#F8FAFC] border border-[#E2E8F0]">
                 <div className="text-[10px] font-medium text-[#64748B] leading-none">Executed</div>
                 <div className="text-[13px] font-bold font-mono text-emerald-600 tabular-nums mt-1 leading-none">
-                  {executionReports.length}
+                  {executionReports.filter((report) => report.status === 'confirmed').length}
                 </div>
               </div>
               <div className="pgo-stat-pill bg-[#F8FAFC] border border-[#E2E8F0]">
                 <div className="text-[10px] font-medium text-[#64748B] leading-none">Latency</div>
                 <div className="text-[13px] font-bold font-mono text-[#0F172A] tabular-nums mt-1 leading-none">
-                  {mcpStatus.latencyMs}ms
+                  {mcpStatus.latencyMs === null ? '—' : `${mcpStatus.latencyMs}ms`}
                 </div>
               </div>
             </div>
@@ -1110,7 +1066,7 @@ export default function App() {
               className="flex items-center justify-between gap-2 text-[11px] text-[#64748B] border-t border-[#E2E8F0]"
             >
               <span className="truncate font-medium">{mcpStatus.engine}</span>
-              <span className="text-emerald-600 font-semibold whitespace-nowrap">0 Missed</span>
+              <span className="text-emerald-600 font-semibold whitespace-nowrap">{executionReports.filter((report) => report.status === 'failed').length} failed</span>
             </div>
           </div>
         </section>
@@ -1170,7 +1126,7 @@ export default function App() {
                     className="font-mono text-[10px] rounded bg-[#0F172A] text-white"
                   >
                     #{hoveredPoint.blockNumber} · {formatGwei(hoveredPoint.gasGwei)} Gwei ·{' '}
-                    {hoveredPoint.txCount} txs
+                    {hoveredPoint.sampleType} · {hoveredPoint.txCount} txs
                   </span>
                 ) : (
                   <span className="text-[10px] text-[#64748B]">Hover node for details</span>
@@ -1362,7 +1318,7 @@ export default function App() {
                   <thead className="bg-white sticky top-0 z-10 border-b border-[#E2E8F0] text-[10px] font-bold text-[#64748B] uppercase tracking-wider">
                     <tr>
                       <th>Block</th>
-                      <th className="text-right">Gas Price</th>
+                      <th className="text-right">Gas Price / Base Fee</th>
                       <th className="text-right">Txs</th>
                       <th className="text-right">Time</th>
                     </tr>
@@ -1395,6 +1351,7 @@ export default function App() {
                                 {formatGwei(item.gasGwei)}
                               </span>
                               <span className="text-[11px] text-[#64748B]">Gwei</span>
+                              <span className="text-[9px] text-[#64748B]">{item.sampleType}</span>
                               {isFavorable && (
                                 <span
                                   style={{ padding: '1px 6px' }}
@@ -1432,7 +1389,7 @@ export default function App() {
                 </p>
               </div>
               <span className="pgo-badge-rect bg-[#EEF2FF] text-[#2448F5] border border-[#2448F5]/20 font-semibold text-[10px] whitespace-nowrap">
-                Auto-Dispatcher
+                RPC and wallet scheduler
               </span>
             </div>
 
@@ -1447,7 +1404,7 @@ export default function App() {
                     <label className="text-[12px] font-bold text-[#0F172A]">
                       1. Select Transaction Preset
                     </label>
-                    <span className="text-[11px] text-[#64748B]">Official Pharos contracts</span>
+                    <span className="text-[11px] text-[#64748B]">Atlantic testnet examples</span>
                   </div>
 
                   <div className="grid grid-cols-3 gap-2">
@@ -1522,7 +1479,7 @@ export default function App() {
                     <input
                       type="text"
                       value={txTo}
-                      onChange={(e) => setTxTo(e.target.value)}
+                      onChange={(e) => { setTxTo(e.target.value); setSelectedPresetId('custom'); }}
                       placeholder="0x838800b758277CC111B2d48Ab01e5E164f8E9471"
                       className={`w-full pgo-input bg-[#F8FAFC] border font-mono text-[12px] text-[#0F172A] focus:bg-white focus:outline-none transition-colors ${
                         isAddressValid
@@ -1544,7 +1501,7 @@ export default function App() {
                       <input
                         type="text"
                         value={txData}
-                        onChange={(e) => setTxData(e.target.value)}
+                        onChange={(e) => { setTxData(e.target.value); setSelectedPresetId('custom'); }}
                         placeholder="0xd0e30db0"
                         className={`w-full pgo-input bg-[#F8FAFC] border font-mono text-[12px] text-[#0F172A] focus:bg-white focus:outline-none transition-colors ${
                           isCalldataValid
@@ -1564,7 +1521,7 @@ export default function App() {
                       <input
                         type="text"
                         value={txValueEth}
-                        onChange={(e) => setTxValueEth(e.target.value)}
+                        onChange={(e) => { setTxValueEth(e.target.value); setSelectedPresetId('custom'); }}
                         placeholder="0.001"
                         className={`w-full pgo-input bg-[#F8FAFC] border font-mono text-[12px] text-[#0F172A] tabular-nums focus:bg-white focus:outline-none transition-colors ${
                           isValueValid
@@ -1605,7 +1562,7 @@ export default function App() {
                       2. Gas Optimization &amp; Deadline Policy
                     </span>
                     <span className="pgo-badge-rect text-[10px] font-semibold text-[#2448F5] bg-[#EEF2FF] border border-[#2448F5]/20">
-                      Zero Missed Deadlines
+                      Deadline triggers a submission attempt
                     </span>
                   </div>
 
@@ -1738,12 +1695,12 @@ export default function App() {
                               {job.label}
                             </span>
                             <span className="pgo-badge-rect bg-amber-100 text-amber-900 border border-amber-200 font-mono font-bold text-[11px] tabular-nums flex-shrink-0">
-                              {job.secondsLeft}s left
+                              {job.status === 'executing' ? 'Submitting…' : `${job.secondsLeft}s left`}
                             </span>
                           </div>
 
                           <div className="flex items-center justify-between text-[11px] font-mono text-[#475569]">
-                            <span>Live: {formatGwei(currentGasGwei)} Gwei</span>
+                            <span>Live: {job.networkId === selectedNetwork ? `${formatGwei(currentGasGwei)} Gwei` : `Select ${PHAROS_NETWORKS[job.networkId].shortName}`}</span>
                             <span className="text-emerald-700 font-bold">
                               Target ≤ {formatGwei(job.targetGasGwei)} Gwei
                             </span>
@@ -1759,12 +1716,13 @@ export default function App() {
                           <div className="flex items-center justify-end gap-2 pt-0.5">
                             <button
                               type="button"
+                              disabled={job.status === 'executing'}
                               onClick={() => {
                                 setQueuedJobs((prev) => prev.filter((j) => j.id !== job.id));
                                 triggerToast('Cancelled pending transaction');
                               }}
                               style={{ padding: '3px 9px' }}
-                              className="rounded-md bg-white hover:bg-rose-50 text-[#475569] hover:text-rose-600 border border-[#CBD5E1] text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer"
+                              className="rounded-md bg-white hover:bg-rose-50 text-[#475569] hover:text-rose-600 border border-[#CBD5E1] text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                             >
                               <X className="w-3 h-3" />
                               <span>Cancel</span>
@@ -1772,6 +1730,7 @@ export default function App() {
 
                             <button
                               type="button"
+                              disabled={job.status === 'executing' || job.networkId !== selectedNetwork}
                               onClick={() => {
                                 setQueuedJobs((prev) => prev.filter((j) => j.id !== job.id));
                                 executeScheduledTransaction(
@@ -1783,7 +1742,7 @@ export default function App() {
                                 );
                               }}
                               style={{ padding: '3px 9px' }}
-                              className="rounded-md bg-[#2448F5] hover:bg-[#1D3BD9] text-white text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer"
+                              className="rounded-md bg-[#2448F5] hover:bg-[#1D3BD9] text-white text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                             >
                               <Play className="w-3 h-3" />
                               <span>Submit Now</span>
@@ -1818,12 +1777,12 @@ export default function App() {
                   <div>
                     <div className="flex items-center gap-2">
                       <h2 className="text-[15px] font-bold text-[#0F172A]">Execution Audit</h2>
-                      <span className="pgo-badge-rect bg-emerald-50 text-emerald-700 border border-emerald-200 font-semibold text-[10px]">
-                        Verified Log
+                      <span className="pgo-badge-rect bg-slate-50 text-slate-700 border border-slate-200 font-semibold text-[10px]">
+                        Receipt Based
                       </span>
                     </div>
                     <p className="text-[11px] text-[#64748B] mt-0.5">
-                      Actual gas paid vs. request-time price &amp; deadline verification
+                      Submitted and mined transaction receipts; projected values stay separate
                     </p>
                   </div>
                 </div>
@@ -1853,17 +1812,17 @@ export default function App() {
                     </div>
                   </div>
                   <div className="pgo-stat-pill bg-[#F8FAFC] border border-[#CBD5E1]">
-                    <div className="text-[10px] text-[#64748B] leading-none">On-Time</div>
+                    <div className="text-[10px] text-[#64748B] leading-none">Receipt Success</div>
                     <div className="text-[12px] font-bold font-mono text-emerald-600 mt-1 leading-none tabular-nums">
-                      {auditSummary.deadlineSuccessRate === null
+                      {auditSummary.successRate === null
                         ? '—'
-                        : `${auditSummary.deadlineSuccessRate}%`}
+                        : `${auditSummary.successRate}%`}
                     </div>
                   </div>
                   <div className="pgo-stat-pill bg-[#F8FAFC] border border-[#CBD5E1]">
                     <div className="text-[10px] text-[#64748B] leading-none">Missed</div>
                     <div className="text-[12px] font-bold font-mono text-[#0F172A] mt-1 leading-none tabular-nums">
-                      {auditSummary.missedDeadlines}
+                      {auditSummary.failedCount}
                     </div>
                   </div>
                 </div>
@@ -1894,21 +1853,31 @@ export default function App() {
                               </span>
                             </div>
                             <div className="text-[10px] text-[#64748B] mt-0.5">
-                              {rep.submittedAt} · Block #{rep.executionBlock.toLocaleString()} ·{' '}
-                              {rep.gasUnits.toLocaleString()} gas
+                              {rep.submittedAt} · {rep.executionBlock ? `Block #${rep.executionBlock.toLocaleString()}` : 'Awaiting receipt'} ·{' '}
+                              {rep.gasUnits ? `${rep.gasUnits.toLocaleString()} gas` : 'Gas unavailable'}
                             </div>
                           </div>
 
                           <span
                             className={`pgo-badge-rect text-[10px] font-semibold whitespace-nowrap flex-shrink-0 ${
-                              isFavorable
+                              rep.status === 'confirmed'
                                 ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                : rep.status === 'failed'
+                                ? 'bg-rose-50 text-rose-700 border border-rose-200'
+                                : rep.status === 'submitted'
+                                ? 'bg-blue-50 text-blue-700 border border-blue-200'
                                 : isDeadline
                                 ? 'bg-amber-50 text-amber-800 border border-amber-200'
                                 : 'bg-[#EEF2FF] text-[#2448F5] border border-[#2448F5]/20'
                             }`}
                           >
-                            {isFavorable
+                            {rep.status === 'confirmed'
+                              ? 'Confirmed'
+                              : rep.status === 'failed'
+                              ? 'Failed'
+                              : rep.status === 'submitted'
+                              ? 'Submitted · pending receipt'
+                              : isFavorable
                               ? 'Favorable Gas Hit'
                               : isDeadline
                               ? 'Deadline Enforced'
@@ -1919,15 +1888,15 @@ export default function App() {
                         {/* Request vs Actual Paid Comparison */}
                         <div className="grid grid-cols-3 gap-2 text-[11px]">
                           <div className="pgo-stat-pill bg-white border border-[#E2E8F0]">
-                            <div className="text-[10px] text-[#64748B]">Request Gas</div>
+                            <div className="text-[10px] text-[#64748B]">Request Gas Price</div>
                             <div className="font-mono font-bold text-[#0F172A] mt-0.5 tabular-nums">
                               {formatGwei(rep.requestGasGwei)} Gwei
                             </div>
                           </div>
                           <div className="pgo-stat-pill bg-white border border-[#E2E8F0]">
-                            <div className="text-[10px] text-[#64748B]">Actual Paid</div>
+                            <div className="text-[10px] text-[#64748B]">Effective Gas Price</div>
                             <div className="font-mono font-bold text-[#2448F5] mt-0.5 tabular-nums">
-                              {formatGwei(rep.actualGasGwei)} Gwei
+                              {rep.actualGasGwei === null ? 'Unavailable' : `${formatGwei(rep.actualGasGwei)} Gwei`}
                             </div>
                           </div>
                           <div className="pgo-stat-pill bg-white border border-[#E2E8F0]">
@@ -1937,10 +1906,14 @@ export default function App() {
                                 rep.savedGweiPerGas >= 0 ? 'text-emerald-600' : 'text-amber-600'
                               }`}
                             >
-                              {rep.savedGweiPerGas >= 0 ? '-' : '+'}
-                              {formatGwei(Math.abs(rep.savedGweiPerGas))} Gwei
+                              {rep.realizedSavingsGwei === null ? 'Not realized' : `${rep.realizedSavingsGwei >= 0 ? '+' : ''}${formatGwei(rep.realizedSavingsGwei)} Gwei`}
                             </div>
                           </div>
+                        </div>
+
+                        <div className="text-[10px] text-[#64748B]">
+                          Receipt fee: {rep.actualFeeWei ? `${formatGwei(weiToGwei(BigInt(rep.actualFeeWei)))} Gwei` : 'Unavailable'}
+                          {rep.projectedRequestFeeWei && ` · Projected at request price: ${formatGwei(weiToGwei(BigInt(rep.projectedRequestFeeWei)))} Gwei`}
                         </div>
 
                         <div
@@ -1965,24 +1938,20 @@ export default function App() {
                               )}
                             </button>
                           ) : (
-                            <span className="font-mono text-[#64748B]">
-                              Block #{rep.executionBlock}
+                              <span className="font-mono text-[#64748B]">
+                              {rep.error || (rep.executionBlock ? `Block #${rep.executionBlock}` : 'No transaction hash')}
                             </span>
                           )}
 
-                          <a
-                            href={
-                              rep.txHash
-                                ? `${rep.explorerUrl}/tx/${rep.txHash}`
-                                : `${rep.explorerUrl}/block/${rep.executionBlock}`
-                            }
+                          {rep.explorerUrl && (rep.txHash || rep.executionBlock) && <a
+                            href={rep.txHash ? `${rep.explorerUrl}/tx/${rep.txHash}` : `${rep.explorerUrl}/block/${rep.executionBlock}`}
                             target="_blank"
                             rel="noreferrer"
                             className="font-semibold text-[#2448F5] hover:underline inline-flex items-center gap-1 flex-shrink-0"
                           >
                             <span>Explorer</span>
                             <ExternalLink className="w-3 h-3" />
-                          </a>
+                          </a>}
                         </div>
                       </div>
                     );
@@ -2034,7 +2003,7 @@ export default function App() {
             <div className="pgo-section-body overflow-y-auto text-[13px] text-[#475569] space-y-4 leading-relaxed">
               <div>
                 <h4 className="font-bold text-[#0F172A] text-[14px] mb-1.5">
-                  1. Official Pharos Endpoints &amp; Explorers
+                  1. Pharos Endpoints &amp; Explorers
                 </h4>
                 <ul className="list-disc pl-5 space-y-1.5">
                   <li>
@@ -2051,7 +2020,7 @@ export default function App() {
                     </a>
                   </li>
                   <li>
-                    <strong className="text-[#0F172A]">Pharos Mainnet (1672):</strong> RPC{' '}
+                    <strong className="text-[#0F172A]">Pharos Pacific Mainnet (1672, PROS):</strong> RPC{' '}
                     <code className="font-mono text-[#0F172A]">https://rpc.pharos.xyz</code> ·
                     Explorer{' '}
                     <a
@@ -2072,31 +2041,19 @@ export default function App() {
                 </h4>
                 <ul className="list-disc pl-5 space-y-1.5">
                   <li>
-                    <strong className="text-[#0F172A]">01 — Tracks Gas Price Over Time:</strong>{' '}
-                    Polls live <code className="font-mono">eth_gasPrice</code>,{' '}
-                    <code className="font-mono">eth_feeHistory</code>, and recent blocks every 6
-                    seconds and plots the interactive SVG trend chart and block activity table.
+                    <strong className="text-[#0F172A]">01 — Live RPC Readings:</strong>{' '}
+                    Polls <code className="font-mono">eth_gasPrice</code> and recent blocks every 6 seconds. Historical points use transaction gas prices when available, otherwise a labeled block base fee. The MCP catalog check is informational; dashboard readings use direct RPC.
                   </li>
                   <li>
-                    <strong className="text-[#0F172A]">
-                      02 — Holds Until Favorable or Deadline:
-                    </strong>{' '}
-                    Accepts any Pharos transaction payload and holds it in a 1-second precision
-                    queue until live gas drops to or below your target ceiling.
+                    <strong className="text-[#0F172A]">02 — Queue and submission:</strong>{' '}
+                    Keeps jobs in page memory. A favorable reading or reached deadline triggers a submission attempt; neither event guarantees acceptance or confirmation.
                   </li>
                   <li>
-                    <strong className="text-[#0F172A]">
-                      03 — Reports Actual Gas Paid vs Request Price:
-                    </strong>{' '}
-                    Records the exact <code className="font-mono">eth_gasPrice</code> at request
-                    time and compares it against the execution gas price and total cost via{' '}
-                    <code className="font-mono">eth_estimateGas</code>.
+                    <strong className="text-[#0F172A]">03 — Receipt reporting:</strong>{' '}
+                    Separates broadcast acceptance from receipt confirmation. Actual fee and realized savings are shown only when a successful receipt includes gas used and effective gas price.
                   </li>
                   <li>
-                    <strong className="text-[#0F172A]">04 — Never Misses the Deadline:</strong> If
-                    the countdown reaches <code className="font-mono">0s</code> while gas remains
-                    above target, the scheduler immediately executes the transaction so no deadline
-                    is ever missed.
+                    <strong className="text-[#0F172A]">04 — Wallet safety:</strong> Unsigned transactions require wallet approval on the selected chain. Presets are Atlantic testnet examples; custom mainnet transactions require editing the transaction fields.
                   </li>
                 </ul>
               </div>
