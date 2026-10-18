@@ -1,6 +1,8 @@
-# Pharos Gas Optimizer
+# Built for Pharos Season of AI
 
-A browser dashboard for Pharos gas readings, historical block samples, and explicitly approved wallet transaction submissions. It does not guarantee inclusion, confirmation, a deadline, or savings.
+# Gas Optimizer for Pharos
+
+A browser dashboard for Pharos gas readings, historical block samples, and explicitly approved wallet transaction submissions. It makes estimates and receipt-backed fees distinguishable; it does not guarantee inclusion, confirmation, a deadline, or savings.
 
 ## Run locally
 
@@ -44,3 +46,5 @@ The transaction presets are Atlantic testnet examples. They are blocked on Pacif
 ## Tests
 
 `npm test` runs the Node test suite for unit conversions, fee arithmetic, input validation, gas history summaries, fee-history indexing, MCP catalog schemas, scheduler triggers, and receipt-based savings arithmetic. Wallet approval flows and live RPC/MCP endpoint behavior need a separate integration environment and are not covered by these unit tests.
+
+Built for the Pharos Season of AI / Pharos AI Agent Arena.
